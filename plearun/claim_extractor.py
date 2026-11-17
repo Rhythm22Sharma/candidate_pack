@@ -87,14 +87,16 @@ class ClaimExtractor:
             claimed_source = "camera"
         elif re.search(r"\b(bodycam|transcript|audio|speech)\b", lower):
             claimed_source = "bodycam"
-        elif re.search(r"\b(dispatch|cad|911\s*call)\b", lower):
+        elif re.search(r"\b(dispatch|cad|911\s*call|dispatched)\b", lower):
             claimed_source = "dispatch"
         elif re.search(r"\b(officer\s*lee)\b", lower):
-            claimed_source = "bodycam"
+            claimed_source = "officer"
 
         # Event type classification
         ev_type = "unknown"
-        if "observed" in lower or "travelling" in lower or speed is not None:
+        if "dispatched" in lower or "unit dispatched" in lower:
+            ev_type = "unit_dispatched"
+        elif "observed" in lower or "travelling" in lower or speed is not None:
             ev_type = "observation"
         elif "pulled into" in lower or "stopped" in lower or "stop" in lower:
             if delta_min is not None and "on scene" in lower:

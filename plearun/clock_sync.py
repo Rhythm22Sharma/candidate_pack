@@ -57,10 +57,16 @@ def parse_flexible_timestamp(val: Any) -> Optional[datetime]:
     return None
 
 def time_str_to_seconds(time_str: str) -> Optional[int]:
-    """Convert time string (ISO or HH:MM:SS) to seconds from midnight."""
+    """Convert time string (ISO, epoch, or HH:MM:SS) to seconds from midnight."""
     if not time_str:
         return None
     val = str(time_str).strip()
+    if val.isdigit():
+        dt = parse_flexible_timestamp(val)
+        if dt:
+            local_dt = dt.astimezone(DEFAULT_TZ)
+            return local_dt.hour * 3600 + local_dt.minute * 60 + local_dt.second
+
     if "T" in val:
         time_part = val.split("T")[1]
     elif " " in val:

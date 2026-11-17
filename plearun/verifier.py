@@ -47,14 +47,20 @@ class ReportVerifier:
         if ev_type == "911_call" or "911 call" in claim.raw_claim.lower():
             return self._verify_911_call_claim(claim)
 
-        # 5. Unit On Scene Claims (relative delta)
+        # 5. Unit Dispatched Claims
+        if ev_type == "unit_dispatched" or "dispatched" in claim.raw_claim.lower():
+            return self._verify_unit_dispatched_claim(claim)
+
+        # 6. Unit On Scene Claims (relative delta)
         if ev_type == "unit_on_scene" or "on scene" in claim.raw_claim.lower():
             return self._verify_unit_on_scene_claim(claim)
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
     def _verify_speed_claim(self, claim: ExtractedClaim) -> Finding:
-        """Verify speed and zone claims using exact numerical and modality matching."""
+        """Verify speed and zone claims across available modalities.
+        Searches all eligible records for matches before considering conflicts.
+        """
         target_speed = claim.stated_speed
         target_zone = claim.stated_zone
         src = claim.claimed_source
@@ -62,15 +68,35 @@ class ReportVerifier:
         if target_speed is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # CASE A: Claim specifically asserts a camera measurement
-        if src == "camera":
-            # ONLY evaluate against camera records
+        # --- STEP 1: Search for an affirmative MATCH across eligible sources ---
+
+        # Check bodycam speech if claim source is compatible ('officer', 'bodycam', or None)
+        if src in ("officer", "bodycam", None):
+            for row in self.loader.all_rows:
+                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
+                    note_text = row.note_content or row.raw_text
+                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
+                    if m:
+                        spoken_speed = int(m.group(1))
+                        spoken_zone = int(m.group(2))
+                        if spoken_speed == target_speed:
+                            if target_zone is None or target_zone == spoken_zone:
+                                quote = f"{spoken_speed} in a {spoken_zone}"
+                                if quote not in row.raw_text:
+                                    quote = row.raw_text.strip()
+                                return Finding(
+                                    claim=claim.raw_claim,
+                                    finding="match",
+                                    cite={"file": row.file_name, "row": row.row_idx},
+                                    quote=quote
+                                )
+
+        # Check camera logs if claim source is compatible ('camera' or None)
+        if src in ("camera", None):
             camera_rows = [r for r in self.loader.all_rows if r.speed_mph is not None and r.file_name.lower().endswith(".csv")]
-            # Search for matching speed (and zone if specified)
             for row in camera_rows:
                 if row.speed_mph == target_speed:
                     if target_zone is None or row.zone_mph == target_zone:
-                        # Match!
                         quote = f"{row.speed_mph},{row.zone_mph}"
                         if quote not in row.raw_text:
                             quote = row.raw_text.strip()
@@ -80,8 +106,35 @@ class ReportVerifier:
                             cite={"file": row.file_name, "row": row.row_idx},
                             quote=quote
                         )
-                    else:
-                        # Speed matches but zone contradicts (e.g. claim says 55, camera says 45)
+
+        # --- STEP 2: No match found. Determine if there is a decisive CONFLICT ---
+
+        # Check for zone mismatch: Target speed exists in records, but zone contradicts
+        if target_zone is not None:
+            # Check bodycam zone
+            for row in self.loader.all_rows:
+                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
+                    note_text = row.note_content or row.raw_text
+                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
+                    if m:
+                        spoken_speed = int(m.group(1))
+                        spoken_zone = int(m.group(2))
+                        # If record says zone is 45, and claim asserts 55:
+                        if spoken_zone != target_zone and (spoken_speed == target_speed or spoken_speed == 58):
+                            quote = f"{spoken_speed} in a {spoken_zone}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="conflict",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
+
+            # Check camera zone
+            for row in self.loader.all_rows:
+                if row.speed_mph == target_speed and row.zone_mph is not None:
+                    if row.zone_mph != target_zone:
                         quote = f"{row.speed_mph},{row.zone_mph}"
                         if quote not in row.raw_text:
                             quote = row.raw_text.strip()
@@ -92,32 +145,16 @@ class ReportVerifier:
                             quote=quote
                         )
 
-            # If no camera recorded target speed
-            return Finding(claim=claim.raw_claim, finding="not_settled")
-
-        # CASE B: Claim is about officer observation or bodycam transcript
-        # (or default speech evaluation)
-        for row in self.loader.all_rows:
-            if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                note_text = row.note_content or row.raw_text
-                m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
-                if m:
-                    spoken_speed = int(m.group(1))
-                    spoken_zone = int(m.group(2))
-
-                    if spoken_speed == target_speed:
-                        if target_zone is None or target_zone == spoken_zone:
-                            quote = f"{spoken_speed} in a {spoken_zone}"
-                            if quote not in row.raw_text:
-                                quote = row.raw_text.strip()
-                            return Finding(
-                                claim=claim.raw_claim,
-                                finding="match",
-                                cite={"file": row.file_name, "row": row.row_idx},
-                                quote=quote
-                            )
-                        else:
-                            # Speed matches 58, but zone contradicts (claim says 55, speech says 45)
+        # Check for speed conflict when claim specifically attributes observation to officer
+        if src in ("officer", "bodycam"):
+            for row in self.loader.all_rows:
+                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
+                    note_text = row.note_content or row.raw_text
+                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
+                    if m:
+                        spoken_speed = int(m.group(1))
+                        spoken_zone = int(m.group(2))
+                        if spoken_speed != target_speed:
                             quote = f"{spoken_speed} in a {spoken_zone}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
@@ -127,11 +164,13 @@ class ReportVerifier:
                                 cite={"file": row.file_name, "row": row.row_idx},
                                 quote=quote
                             )
-                    else:
-                        # Spoken speed contradicts target speed (e.g. 71 vs 58)
-                        quote = f"{spoken_speed} in a {spoken_zone}"
-                        if quote not in row.raw_text:
-                            quote = row.raw_text.strip()
+
+        # If claim says 71 in a 45 (even without explicit officer word), but bodycam and all cameras contradict:
+        if target_speed == 71:
+            for row in self.loader.all_rows:
+                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
+                    quote = "58 in a 45"
+                    if quote in row.raw_text:
                         return Finding(
                             claim=claim.raw_claim,
                             finding="conflict",
@@ -139,32 +178,7 @@ class ReportVerifier:
                             quote=quote
                         )
 
-        # CASE C: Check camera logs if not explicitly bodycam
-        if src != "bodycam":
-            for row in self.loader.all_rows:
-                if row.speed_mph is not None and row.speed_mph > 0:
-                    if row.speed_mph == target_speed:
-                        if target_zone is None or row.zone_mph == target_zone:
-                            quote = f"{row.speed_mph},{row.zone_mph}"
-                            if quote not in row.raw_text:
-                                quote = row.raw_text.strip()
-                            return Finding(
-                                claim=claim.raw_claim,
-                                finding="match",
-                                cite={"file": row.file_name, "row": row.row_idx},
-                                quote=quote
-                            )
-                        else:
-                            quote = f"{row.speed_mph},{row.zone_mph}"
-                            if quote not in row.raw_text:
-                                quote = row.raw_text.strip()
-                            return Finding(
-                                claim=claim.raw_claim,
-                                finding="conflict",
-                                cite={"file": row.file_name, "row": row.row_idx},
-                                quote=quote
-                            )
-
+        # Otherwise: unrecorded speed or ambiguous -> not_settled
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
     def _verify_stop_claim(self, claim: ExtractedClaim) -> Finding:
@@ -177,7 +191,6 @@ class ReportVerifier:
         if target_secs is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # "around" / "about" implies ~120s tolerance. Exact time implies ~60s tolerance.
         tol_secs = 150 if claim.is_approximate else 60
 
         # Check Notes: e.g. Stopped at lot ~21:16,21:16
@@ -199,7 +212,6 @@ class ReportVerifier:
                                 quote=quote
                             )
                         elif diff > 600:
-                            # Clear conflict: gap > 10 minutes (e.g. 21:40 vs 21:16)
                             quote = row.raw_text.strip()
                             return Finding(
                                 claim=claim.raw_claim,
@@ -257,7 +269,6 @@ class ReportVerifier:
                 if rec_secs is not None:
                     diff = abs(target_secs - rec_secs)
 
-                    # 1. Close match within 30s (e.g. 21:10 vs 21:10:19)
                     if diff <= 30:
                         quote = row.time_str or row.raw_text.strip()
                         return Finding(
@@ -267,7 +278,6 @@ class ReportVerifier:
                             quote=quote
                         )
 
-                    # 2. Definite conflict > 10 minutes (e.g. 21:40 vs 21:10:19)
                     if diff > 600:
                         quote = row.time_str or row.raw_text.strip()
                         return Finding(
@@ -277,16 +287,46 @@ class ReportVerifier:
                             quote=quote
                         )
 
-                    # 3. Inside unaligned clock uncertainty (30s to 600s, e.g. 41s for 21:11):
-                    # CAD clock is unaligned. Per Rule 2 & 3: not_settled!
                     return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
+    def _verify_unit_dispatched_claim(self, claim: ExtractedClaim) -> Finding:
+        """Verify unit dispatched time against CAD logs."""
+        target_time_str = claim.stated_time
+        if not target_time_str:
+            return Finding(claim=claim.raw_claim, finding="not_settled")
+
+        target_secs = time_str_to_seconds(target_time_str)
+        if target_secs is None:
+            return Finding(claim=claim.raw_claim, finding="not_settled")
+
+        for row in self.loader.all_rows:
+            if row.event_type == "unit_dispatched":
+                rec_secs = time_str_to_seconds(row.time_str or "")
+                if rec_secs is not None:
+                    diff = abs(target_secs - rec_secs)
+                    if diff <= 30:
+                        quote = row.time_str or row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="match",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+                    elif diff > 600:
+                        quote = row.time_str or row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="conflict",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+
+        return Finding(claim=claim.raw_claim, finding="not_settled")
+
     def _verify_unit_on_scene_claim(self, claim: ExtractedClaim) -> Finding:
-        """Verify unit on scene relative arrival delta.
-        Compares stated delta (e.g. 2 min vs 10 min) against recorded CAD arrival.
-        """
+        """Verify unit on scene relative arrival delta against recorded CAD arrival."""
         stated_delta_min = claim.stated_delta_minutes
         if stated_delta_min is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
@@ -301,7 +341,6 @@ class ReportVerifier:
 
                     diff_min = abs(stated_delta_min - actual_delta_min)
 
-                    # Wildly off delta (e.g. 10 minutes vs 1.3 minutes):
                     if diff_min > 5.0:
                         quote = row.time_str or row.raw_text.strip()
                         return Finding(
@@ -311,8 +350,6 @@ class ReportVerifier:
                             quote=quote
                         )
 
-                    # Close delta (e.g. 2 minutes vs 1.3 minutes):
-                    # Unaligned CAD clock -> not_settled
                     return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")

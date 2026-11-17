@@ -115,6 +115,24 @@ class TestVerifier(unittest.TestCase):
         self.assertEqual(f.cite["file"], "dispatch.json")
         self.assertEqual(f.cite["row"], 9)
 
+    def test_generic_speed_claim_matches_camera_log(self):
+        """A generic claim without source word matches camera logs if speed exists in camera."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("The vehicle was travelling 67 mph.")[0]
+        f = self.verifier.verify_claim(c)
+        self.assertEqual(f.finding, "match")
+        self.assertEqual(f.cite["file"], "camera_log.csv")
+        self.assertEqual(f.cite["row"], 4)
+
+    def test_unit_dispatched_at_2114_matches_cad(self):
+        """A claim asserting unit dispatched at 21:14 matches CAD epoch 1772504040000 (21:14:00)."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("A unit was dispatched at 21:14.")[0]
+        f = self.verifier.verify_claim(c)
+        self.assertEqual(f.finding, "match")
+        self.assertEqual(f.cite["file"], "dispatch.json")
+        self.assertEqual(f.cite["row"], 20)
+
     def test_rule_1_downgrades_to_not_settled_on_quote_mismatch(self):
         fake_finding = Finding(
             claim="Officer Lee observed the vehicle.",
