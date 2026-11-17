@@ -14,6 +14,7 @@
 
 ## What It Gets Wrong
 - **Untimed Claims**: Sourceless untimed speeds return `not_settled` even if the vehicle reached that speed at some point on the highway.
+- **Zone Inference**: '55 zone' conflicts with bodycam '45 zone' under the assumption that corridor records cover the entire incident roadway.
 - **Compound Claims**: Claim 1 contains speed and time; the tool evaluates the assertion as a whole rather than emitting separate micro-findings.
 - **CAD Unaligned**: CAD clock drift cannot be calibrated without shared anchors, keeping timing uncertainty wide (±90s).
 - **Regex Extraction**: Unconventional narrative syntax or typos can evade pattern extractors.
