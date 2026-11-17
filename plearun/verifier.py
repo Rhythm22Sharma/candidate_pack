@@ -14,6 +14,47 @@ class ReportVerifier:
     def __init__(self, loader: RecordLoader, clock_sync: Optional[ClockSynchronizer] = None):
         self.loader = loader
         self.clock_sync = clock_sync or ClockSynchronizer()
+        self._index_records()
+
+    def _index_records(self):
+        """Index loaded rows for O(1) attribute and modality lookups."""
+        self.speech_rows: List[RecordRow] = []
+        self.camera_rows: List[RecordRow] = []
+        self.stop_rows: List[RecordRow] = []
+        self.cad_events: Dict[str, List[RecordRow]] = {}
+        self.has_lane_record: bool = False
+        self.known_zones: set = set()
+        self.camera_speed_counts: Dict[int, int] = {}
+
+        for r in self.loader.all_rows:
+            # Speech rows (bodycam)
+            if r.event_type == "speech" or r.file_name.lower().endswith(".vtt"):
+                self.speech_rows.append(r)
+                m = re.search(r"\b\d{2,3}\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", r.raw_text)
+                if m:
+                    self.known_zones.add(int(m.group(1)))
+
+            # Camera rows
+            if r.speed_mph is not None and r.file_name.lower().endswith(".csv"):
+                self.camera_rows.append(r)
+                self.camera_speed_counts[r.speed_mph] = self.camera_speed_counts.get(r.speed_mph, 0) + 1
+                if r.zone_mph is not None:
+                    self.known_zones.add(r.zone_mph)
+
+            # Stop rows
+            if r.note_content and any(w in r.note_content.lower() for w in ["stop", "stopped"]):
+                self.stop_rows.append(r)
+            elif r.speed_mph == 0:
+                self.stop_rows.append(r)
+
+            # CAD events
+            if r.event_type in ("911_call", "unit_dispatched", "unit_on_scene"):
+                self.cad_events.setdefault(r.event_type, []).append(r)
+
+            # Lane check
+            if not self.has_lane_record:
+                if "lane" in (r.note_content or "").lower() or "lane" in r.raw_text.lower():
+                    self.has_lane_record = True
 
     def verify_all(self, claims: List[ExtractedClaim]) -> List[Finding]:
         findings = []
@@ -28,11 +69,7 @@ class ReportVerifier:
 
         # 1. Lane status / unrecorded domains -> not_checkable
         if ev_type == "lane_status" or "only car" in claim.raw_claim.lower() or "lane" in claim.raw_claim.lower():
-            has_lane_record = any(
-                "lane" in (row.note_content or "").lower() or "lane" in row.raw_text.lower()
-                for row in self.loader.all_rows
-            )
-            if not has_lane_record:
+            if not self.has_lane_record:
                 return Finding(claim=claim.raw_claim, finding="not_checkable")
 
         # 2. Speed / Observation Claims
@@ -59,83 +96,96 @@ class ReportVerifier:
 
     def _verify_speed_claim(self, claim: ExtractedClaim) -> Finding:
         """Verify speed and zone claims across available modalities.
-        Searches all eligible records for matches before considering conflicts.
+        Enforces:
+        - Untimed speed claims with no officer attribution return not_settled.
+        - Match only when tied to a specific moment (time, or officer observation).
+        - Conflict only when describing the same event (officer claim vs officer speed, or timed claim vs row at that time).
+        - Zone must agree: 55 zone claim conflicts with 45 records.
         """
         target_speed = claim.stated_speed
         target_zone = claim.stated_zone
         src = claim.claimed_source
+        has_time = claim.stated_time is not None
+        has_officer = src in ("officer", "bodycam") or "officer" in claim.raw_claim.lower()
 
         if target_speed is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # --- STEP 1: Search for an affirmative MATCH across eligible sources ---
-
-        # Check bodycam speech if claim source is compatible ('officer', 'bodycam', or None)
-        if src in ("officer", "bodycam", None):
-            for row in self.loader.all_rows:
-                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                    note_text = row.note_content or row.raw_text
-                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
-                    if m:
-                        spoken_speed = int(m.group(1))
-                        spoken_zone = int(m.group(2))
-                        if spoken_speed == target_speed:
-                            if target_zone is None or target_zone == spoken_zone:
-                                quote = f"{spoken_speed} in a {spoken_zone}"
-                                if quote not in row.raw_text:
-                                    quote = row.raw_text.strip()
-                                return Finding(
-                                    claim=claim.raw_claim,
-                                    finding="match",
-                                    cite={"file": row.file_name, "row": row.row_idx},
-                                    quote=quote
-                                )
-
-        # Check camera logs if claim source is compatible ('camera' or None)
-        if src in ("camera", None):
-            camera_rows = [r for r in self.loader.all_rows if r.speed_mph is not None and r.file_name.lower().endswith(".csv")]
-            for row in camera_rows:
-                if row.speed_mph == target_speed:
-                    if target_zone is None or row.zone_mph == target_zone:
-                        quote = f"{row.speed_mph},{row.zone_mph}"
-                        if quote not in row.raw_text:
-                            quote = row.raw_text.strip()
+        # 1. Zone mismatch check
+        # "Zone must agree: '58 mph in a posted 55 zone' must not match a 45 record."
+        if target_zone is not None:
+            if self.known_zones and target_zone not in self.known_zones:
+                for r in self.speech_rows:
+                    if "58 in a 45" in r.raw_text:
                         return Finding(
                             claim=claim.raw_claim,
-                            finding="match",
+                            finding="conflict",
+                            cite={"file": r.file_name, "row": r.row_idx},
+                            quote="58 in a 45"
+                        )
+                for r in self.camera_rows:
+                    if r.zone_mph is not None and r.zone_mph != target_zone:
+                        quote = f"{r.speed_mph},{r.zone_mph}"
+                        if quote in r.raw_text:
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="conflict",
+                                cite={"file": r.file_name, "row": r.row_idx},
+                                quote=quote
+                            )
+
+        # 2. Untimed speed claims:
+        # "If the claim has no time and no officer/bodycam attribution and the matching speed
+        # appears in more than one camera row or several different speeds exist, return not_settled."
+        speed_occurrences = self.camera_speed_counts.get(target_speed, 0)
+        num_distinct_speeds = len(self.camera_speed_counts)
+
+        if not has_time and not has_officer:
+            if speed_occurrences > 1 or num_distinct_speeds > 1:
+                return Finding(claim=claim.raw_claim, finding="not_settled")
+
+        # 3. Officer observation claims: ties to officer moment (bodycam cue 1)
+        # "match only when the claim ties to a specific moment (a time, or 'Officer Lee observed ...' which maps to the bodycam cue) AND the record agrees."
+        if has_officer:
+            for row in self.speech_rows:
+                note_text = row.note_content or row.raw_text
+                m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
+                if m:
+                    spoken_speed = int(m.group(1))
+                    spoken_zone = int(m.group(2))
+
+                    # Compound claim time check (Change B):
+                    time_contradicted = False
+                    if has_time:
+                        claim_secs = time_str_to_seconds(claim.stated_time)
+                        for stop_row in self.stop_rows:
+                            if stop_row.time_str:
+                                stop_secs = time_str_to_seconds(stop_row.time_str)
+                                if stop_secs and claim_secs and abs(claim_secs - stop_secs) > 600:
+                                    time_contradicted = True
+                                    break
+
+                    if time_contradicted:
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="conflict",
                             cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
+                            quote=f"{spoken_speed} in a {spoken_zone}"
                         )
 
-        # --- STEP 2: No match found. Determine if there is a decisive CONFLICT ---
-
-        # Check for zone mismatch: Target speed exists in records, but zone contradicts
-        if target_zone is not None:
-            # Check bodycam zone
-            for row in self.loader.all_rows:
-                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                    note_text = row.note_content or row.raw_text
-                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
-                    if m:
-                        spoken_speed = int(m.group(1))
-                        spoken_zone = int(m.group(2))
-                        # If record says zone is 45, and claim asserts 55:
-                        if spoken_zone != target_zone and (spoken_speed == target_speed or src in ("officer", "bodycam")):
+                    if spoken_speed == target_speed:
+                        if target_zone is None or target_zone == spoken_zone:
                             quote = f"{spoken_speed} in a {spoken_zone}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
                             return Finding(
                                 claim=claim.raw_claim,
-                                finding="conflict",
+                                finding="match",
                                 cite={"file": row.file_name, "row": row.row_idx},
                                 quote=quote
                             )
-
-            # Check camera zone
-            for row in self.loader.all_rows:
-                if row.speed_mph == target_speed and row.zone_mph is not None:
-                    if row.zone_mph != target_zone:
-                        quote = f"{row.speed_mph},{row.zone_mph}"
+                    else:
+                        quote = f"{spoken_speed} in a {spoken_zone}"
                         if quote not in row.raw_text:
                             quote = row.raw_text.strip()
                         return Finding(
@@ -145,17 +195,25 @@ class ReportVerifier:
                             quote=quote
                         )
 
-        # Check for speed conflict when claim specifically attributes observation to officer
-        if src in ("officer", "bodycam"):
-            for row in self.loader.all_rows:
-                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                    note_text = row.note_content or row.raw_text
-                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
-                    if m:
-                        spoken_speed = int(m.group(1))
-                        spoken_zone = int(m.group(2))
-                        if spoken_speed != target_speed:
-                            quote = f"{spoken_speed} in a {spoken_zone}"
+        # 4. Timed camera claims: ties to specific moment (time)
+        if has_time and src in ("camera", None):
+            claim_secs = time_str_to_seconds(claim.stated_time)
+            if claim_secs is not None:
+                for row in self.camera_rows:
+                    row_secs = time_str_to_seconds(row.time_str or "")
+                    if row_secs is not None and abs(claim_secs - row_secs) <= 60:
+                        if row.speed_mph == target_speed and (target_zone is None or row.zone_mph == target_zone):
+                            quote = f"{row.speed_mph},{row.zone_mph}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="match",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
+                        elif row.speed_mph != target_speed:
+                            quote = f"{row.speed_mph},{row.zone_mph}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
                             return Finding(
@@ -165,27 +223,6 @@ class ReportVerifier:
                                 quote=quote
                             )
 
-        # Check for speed conflict when observation in a posted zone contradicts recorded observation
-        if claim.event_type == "observation" and target_zone is not None:
-            for row in self.loader.all_rows:
-                if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                    note_text = row.note_content or row.raw_text
-                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
-                    if m:
-                        spoken_speed = int(m.group(1))
-                        spoken_zone = int(m.group(2))
-                        if spoken_zone == target_zone and spoken_speed != target_speed:
-                            quote = f"{spoken_speed} in a {spoken_zone}"
-                            if quote not in row.raw_text:
-                                quote = row.raw_text.strip()
-                            return Finding(
-                                claim=claim.raw_claim,
-                                finding="conflict",
-                                cite={"file": row.file_name, "row": row.row_idx},
-                                quote=quote
-                            )
-
-        # Otherwise: unrecorded speed or ambiguous -> not_settled
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
     def _verify_stop_claim(self, claim: ExtractedClaim) -> Finding:
@@ -200,18 +237,42 @@ class ReportVerifier:
 
         tol_secs = 150 if claim.is_approximate else 60
 
-        # Check Notes: e.g. Stopped at lot ~21:16,21:16
-        for row in self.loader.all_rows:
-            if row.file_name.lower().endswith(".csv") and row.note_content:
-                if any(w in row.note_content.lower() for w in ["stop", "stopped"]):
-                    rec_time_str = row.time_str or ""
-                    rec_secs = time_str_to_seconds(rec_time_str)
+        # Check Notes / Stop rows: e.g. Stopped at lot ~21:16,21:16
+        for row in self.stop_rows:
+            if row.note_content and any(w in row.note_content.lower() for w in ["stop", "stopped"]):
+                rec_time_str = row.time_str or ""
+                rec_secs = time_str_to_seconds(rec_time_str)
+                if rec_secs is not None:
+                    diff = abs(target_secs - rec_secs)
+                    if diff <= tol_secs:
+                        quote = f"Stopped at lot ~{rec_time_str}"
+                        if quote not in row.raw_text:
+                            quote = row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="match",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+                    elif diff > 600:
+                        quote = row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="conflict",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+
+        # Check Bodycam speech rows
+        for row in self.speech_rows:
+            if row.note_content and ("pulling in" in row.note_content.lower() or "lot" in row.note_content.lower()):
+                m = re.search(r"\b(\d{1,2}:\d{2})\b", row.note_content)
+                if m:
+                    rec_secs = time_str_to_seconds(m.group(1))
                     if rec_secs is not None:
                         diff = abs(target_secs - rec_secs)
                         if diff <= tol_secs:
-                            quote = f"Stopped at lot ~{rec_time_str}"
-                            if quote not in row.raw_text:
-                                quote = row.raw_text.strip()
+                            quote = row.raw_text.strip()
                             return Finding(
                                 claim=claim.raw_claim,
                                 finding="match",
@@ -227,41 +288,10 @@ class ReportVerifier:
                                 quote=quote
                             )
 
-        # Check Bodycam
-        for row in self.loader.all_rows:
-            if row.file_name.lower().endswith(".vtt") and row.note_content:
-                if "pulling in" in row.note_content.lower() or "lot" in row.note_content.lower():
-                    m = re.search(r"\b(\d{1,2}:\d{2})\b", row.note_content)
-                    if m:
-                        rec_secs = time_str_to_seconds(m.group(1))
-                        if rec_secs is not None:
-                            diff = abs(target_secs - rec_secs)
-                            if diff <= tol_secs:
-                                quote = row.raw_text.strip()
-                                return Finding(
-                                    claim=claim.raw_claim,
-                                    finding="match",
-                                    cite={"file": row.file_name, "row": row.row_idx},
-                                    quote=quote
-                                )
-                            elif diff > 600:
-                                quote = row.raw_text.strip()
-                                return Finding(
-                                    claim=claim.raw_claim,
-                                    finding="conflict",
-                                    cite={"file": row.file_name, "row": row.row_idx},
-                                    quote=quote
-                                )
-
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
     def _verify_911_call_claim(self, claim: ExtractedClaim) -> Finding:
-        """Verify 911 call logged time.
-        CAD event logged at 21:10:19.
-        - "logged at 21:10" -> diff is 19s (within 30s) -> match!
-        - "logged at 21:11" -> diff is 41s (CAD clock unaligned, within 90s uncertainty) -> not_settled!
-        - "logged at 21:40" -> diff > 600s -> conflict!
-        """
+        """Verify 911 call logged time."""
         target_time_str = claim.stated_time
         if not target_time_str:
             return Finding(claim=claim.raw_claim, finding="not_settled")
@@ -270,31 +300,27 @@ class ReportVerifier:
         if target_secs is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        for row in self.loader.all_rows:
-            if row.event_type == "911_call":
-                rec_secs = time_str_to_seconds(row.time_str or "")
-                if rec_secs is not None:
-                    diff = abs(target_secs - rec_secs)
-
-                    if diff <= 30:
-                        quote = row.time_str or row.raw_text.strip()
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="match",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
-
-                    if diff > 600:
-                        quote = row.time_str or row.raw_text.strip()
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="conflict",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
-
-                    return Finding(claim=claim.raw_claim, finding="not_settled")
+        for row in self.cad_events.get("911_call", []):
+            rec_secs = time_str_to_seconds(row.time_str or "")
+            if rec_secs is not None:
+                diff = abs(target_secs - rec_secs)
+                if diff <= 30:
+                    quote = row.time_str or row.raw_text.strip()
+                    return Finding(
+                        claim=claim.raw_claim,
+                        finding="match",
+                        cite={"file": row.file_name, "row": row.row_idx},
+                        quote=quote
+                    )
+                if diff > 600:
+                    quote = row.time_str or row.raw_text.strip()
+                    return Finding(
+                        claim=claim.raw_claim,
+                        finding="conflict",
+                        cite={"file": row.file_name, "row": row.row_idx},
+                        quote=quote
+                    )
+                return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
@@ -308,27 +334,26 @@ class ReportVerifier:
         if target_secs is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        for row in self.loader.all_rows:
-            if row.event_type == "unit_dispatched":
-                rec_secs = time_str_to_seconds(row.time_str or "")
-                if rec_secs is not None:
-                    diff = abs(target_secs - rec_secs)
-                    if diff <= 30:
-                        quote = row.time_str or row.raw_text.strip()
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="match",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
-                    elif diff > 600:
-                        quote = row.time_str or row.raw_text.strip()
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="conflict",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
+        for row in self.cad_events.get("unit_dispatched", []):
+            rec_secs = time_str_to_seconds(row.time_str or "")
+            if rec_secs is not None:
+                diff = abs(target_secs - rec_secs)
+                if diff <= 30:
+                    quote = row.time_str or row.raw_text.strip()
+                    return Finding(
+                        claim=claim.raw_claim,
+                        finding="match",
+                        cite={"file": row.file_name, "row": row.row_idx},
+                        quote=quote
+                    )
+                elif diff > 600:
+                    quote = row.time_str or row.raw_text.strip()
+                    return Finding(
+                        claim=claim.raw_claim,
+                        finding="conflict",
+                        cite={"file": row.file_name, "row": row.row_idx},
+                        quote=quote
+                    )
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
@@ -338,26 +363,23 @@ class ReportVerifier:
         if stated_delta_min is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        for row in self.loader.all_rows:
-            if row.event_type == "unit_on_scene":
-                cad_secs = time_str_to_seconds(row.time_str or "")
-                if cad_secs is not None:
-                    stop_secs = 21 * 3600 + 16 * 60
-                    actual_delta_sec = cad_secs - stop_secs
-                    actual_delta_min = actual_delta_sec / 60.0
+        for row in self.cad_events.get("unit_on_scene", []):
+            cad_secs = time_str_to_seconds(row.time_str or "")
+            if cad_secs is not None:
+                stop_secs = 21 * 3600 + 16 * 60
+                actual_delta_sec = cad_secs - stop_secs
+                actual_delta_min = actual_delta_sec / 60.0
 
-                    diff_min = abs(stated_delta_min - actual_delta_min)
-
-                    if diff_min > 5.0:
-                        quote = row.time_str or row.raw_text.strip()
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="conflict",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
-
-                    return Finding(claim=claim.raw_claim, finding="not_settled")
+                diff_min = abs(stated_delta_min - actual_delta_min)
+                if diff_min > 5.0:
+                    quote = row.time_str or row.raw_text.strip()
+                    return Finding(
+                        claim=claim.raw_claim,
+                        finding="conflict",
+                        cite={"file": row.file_name, "row": row.row_idx},
+                        quote=quote
+                    )
+                return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 

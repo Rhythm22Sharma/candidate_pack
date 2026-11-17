@@ -101,5 +101,78 @@ class TestParsers(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir)
 
+    def test_utf16_record_and_crlf_line_endings(self):
+        """Test loading a record file encoded in UTF-16 with Windows CRLF endings."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            csv_path = os.path.join(tmp_dir, "records_utf16_crlf.csv")
+            content = "timestamp,device,speed_mph,zone_mph\r\n1772504000000,CAM-01,58,45\r\n1772504010000,CAM-01,60,45\r\n"
+            with open(csv_path, "wb") as f:
+                f.write(content.encode("utf-16"))
+
+            loader = RecordLoader()
+            loaded = loader.load_file(csv_path)
+            self.assertEqual(len(loaded.rows), 2)
+            self.assertEqual(loaded.rows[0].speed_mph, 58)
+            self.assertEqual(loaded.rows[0].row_idx, 2)
+            # Verify exact quote matching works on UTF-16 CRLF record
+            self.assertTrue(loader.verify_substring("records_utf16_crlf.csv", 2, "58,45"))
+        finally:
+            shutil.rmtree(tmp_dir)
+
+    def test_rule_1_exact_raw_preservation_accents_and_case(self):
+        """Rule 1: quote must match exact raw row preserving case, spacing, and accents."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            csv_path = os.path.join(tmp_dir, "accents_cp1252.csv")
+            # Write CP1252 text with French/Spanish accents
+            raw_text = "ID,Author,Note,Time\nN-99,Ofc. Café,\"Arrêté près du café\",21:16\n"
+            with open(csv_path, "wb") as f:
+                f.write(raw_text.encode("cp1252"))
+
+            loader = RecordLoader()
+            loader.load_file(csv_path)
+
+            # Exact quote matches
+            self.assertTrue(loader.verify_substring("accents_cp1252.csv", 2, "Arrêté près du café"))
+            # Normalized or lowercase fails
+            self.assertFalse(loader.verify_substring("accents_cp1252.csv", 2, "arrete pres du cafe"))
+            self.assertFalse(loader.verify_substring("accents_cp1252.csv", 2, "ARRÊTÉ"))
+        finally:
+            shutil.rmtree(tmp_dir)
+
+    def test_vtt_overlapping_cues_cites_correct_cue_number(self):
+        """Test VTT cue indexing with overlapping time intervals."""
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            vtt_path = os.path.join(tmp_dir, "overlap.vtt")
+            vtt_text = (
+                "WEBVTT\n\n"
+                "00:00:01.000 --> 00:00:05.000\n"
+                "Officer: First statement\n\n"
+                "00:00:03.000 --> 00:00:07.000\n"
+                "Dispatch: Overlapping response\n\n"
+                "00:00:06.000 --> 00:00:10.000\n"
+                "Officer: Third observation\n\n"
+            )
+            with open(vtt_path, "w", encoding="utf-8") as f:
+                f.write(vtt_text)
+
+            loader = RecordLoader()
+            loaded = loader.load_file(vtt_path)
+            self.assertEqual(len(loaded.rows), 3)
+
+            # Cue 1
+            self.assertEqual(loaded.rows[0].row_idx, 1)
+            self.assertTrue(loader.verify_substring("overlap.vtt", 1, "First statement"))
+            # Cue 2
+            self.assertEqual(loaded.rows[1].row_idx, 2)
+            self.assertTrue(loader.verify_substring("overlap.vtt", 2, "Overlapping response"))
+            # Cue 3
+            self.assertEqual(loaded.rows[2].row_idx, 3)
+            self.assertTrue(loader.verify_substring("overlap.vtt", 3, "Third observation"))
+        finally:
+            shutil.rmtree(tmp_dir)
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,9 @@ def contains_adversarial_injection(text: str) -> bool:
     """Check if the text contains prompt injection or code execution patterns."""
     if not isinstance(text, str):
         return False
+    lower = text.lower()
+    if not any(k in lower for k in ("ignore", "disregard", "system", "eval", "exec", "__import__", "script", "you must")):
+        return False
     for pat in INJECTION_PATTERNS:
         if pat.search(text):
             return True

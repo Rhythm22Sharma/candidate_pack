@@ -141,23 +141,22 @@ class ClockSynchronizer:
                 diffs = [(ref_stop - t).total_seconds() for t in times]
                 # Filter to plausible drifts (< max_allowed_drift)
                 plausible = [d for d in diffs if abs(d) <= self.max_allowed_drift]
-                # If we have anchors, assess confidence
-                if len(plausible) >= 1:
-                    # In sample data, CAM-03 and CAM-07 each have stop events.
-                    # However, without a second independent anchor event to verify drift rate,
-                    # confidence is moderate. We record estimated offset, but note unaligned status
-                    # if confidence is below threshold.
-                    avg_diff = sum(plausible) / len(plausible)
-                    # Check if single anchor is sufficiently consistent
-                    if len(plausible) >= self.min_anchors:
+                
+                # Require at least 2 anchors that agree within 5 seconds
+                if len(plausible) >= self.min_anchors:
+                    spread = max(plausible) - min(plausible)
+                    if spread <= 5.0:
+                        avg_diff = sum(plausible) / len(plausible)
                         self.device_offsets[src] = avg_diff
-                        self.device_confidence[src] = 0.9
+                        self.device_confidence[src] = 1.0
                     else:
-                        # Single anchor: record tentative offset with lower confidence
-                        self.device_offsets[src] = avg_diff
-                        self.device_confidence[src] = 0.5
+                        # Anchors disagree (>5s spread): must remain unaligned
+                        self.unaligned_devices.add(src)
+                        self.device_confidence[src] = 0.0
                 else:
+                    # Single anchor: insufficient multi-source correlation, must remain unaligned
                     self.unaligned_devices.add(src)
+                    self.device_confidence[src] = 0.0
             else:
                 self.unaligned_devices.add(src)
 

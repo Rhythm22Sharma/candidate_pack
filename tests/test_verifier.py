@@ -89,14 +89,30 @@ class TestVerifier(unittest.TestCase):
         self.assertNotEqual(f4.finding, "match", "10 minutes must not match ~1.3 minute actual delta!")
         self.assertEqual(f4.finding, "conflict")
 
-    def test_camera_modality_matches_camera_log(self):
-        """Camera-specific claims must evaluate against camera logs, not bodycam speech."""
+    def test_untimed_speed_claims_return_not_settled(self):
+        """Untimed speed claims without officer attribution must return not_settled per Change A."""
         extractor = ClaimExtractor()
-        c = extractor.extract_from_text("The camera recorded the vehicle at 67 mph.")[0]
+        c1 = extractor.extract_from_text("The vehicle was travelling 67 mph.")[0]
+        f1 = self.verifier.verify_claim(c1)
+        self.assertEqual(f1.finding, "not_settled")
+        self.assertIsNone(f1.cite)
+        self.assertIsNone(f1.quote)
+
+        c2 = extractor.extract_from_text("The camera recorded the vehicle at 67 mph.")[0]
+        f2 = self.verifier.verify_claim(c2)
+        self.assertEqual(f2.finding, "not_settled")
+        self.assertIsNone(f2.cite)
+        self.assertIsNone(f2.quote)
+
+    def test_timed_camera_claim_matches_camera_log(self):
+        """A camera claim with a specific time matches the camera log at that moment."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("At 20:51 the camera recorded the vehicle at 67 mph.")[0]
         f = self.verifier.verify_claim(c)
         self.assertEqual(f.finding, "match")
         self.assertEqual(f.cite["file"], "camera_log.csv")
         self.assertEqual(f.cite["row"], 4)
+        self.assertEqual(f.quote, "67,45")
 
     def test_zone_mismatch_triggers_conflict(self):
         """A claim asserting 58 mph in a posted 55 zone must NOT match a 45 zone record."""
@@ -114,15 +130,6 @@ class TestVerifier(unittest.TestCase):
         self.assertEqual(f.finding, "match")
         self.assertEqual(f.cite["file"], "dispatch.json")
         self.assertEqual(f.cite["row"], 9)
-
-    def test_generic_speed_claim_matches_camera_log(self):
-        """A generic claim without source word matches camera logs if speed exists in camera."""
-        extractor = ClaimExtractor()
-        c = extractor.extract_from_text("The vehicle was travelling 67 mph.")[0]
-        f = self.verifier.verify_claim(c)
-        self.assertEqual(f.finding, "match")
-        self.assertEqual(f.cite["file"], "camera_log.csv")
-        self.assertEqual(f.cite["row"], 4)
 
     def test_unit_dispatched_at_2114_matches_cad(self):
         """A claim asserting unit dispatched at 21:14 matches CAD epoch 1772504040000 (21:14:00)."""

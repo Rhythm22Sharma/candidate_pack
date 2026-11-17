@@ -4,6 +4,22 @@ from typing import List, Optional
 from plearun.models import ExtractedClaim
 from plearun.clock_sync import time_str_to_seconds
 
+TITLES = [r"Mr\.", r"Mrs\.", r"Ms\.", r"Dr\.", r"Lt\.", r"Sgt\.", r"Ofc\.", r"Det\."]
+
+def split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences while protecting titles (Lt., Mr.), times (21:14),
+    decimals (2.5), and abbreviations (a.m., p.m.).
+    """
+    placeholder = "___TITLE_DOT___"
+    masked = text
+    for t in TITLES:
+        pattern = re.compile(r"\b" + t + r"\s+(?=[A-Z])", re.IGNORECASE)
+        masked = pattern.sub(lambda m: m.group(0).replace(".", placeholder), masked)
+    # Mask a.m. / p.m. when followed by lowercase or comma
+    masked = re.sub(r"\b([ap]\.m\.)\s+(?=[a-z,])", lambda m: m.group(0).replace(".", placeholder), masked, flags=re.IGNORECASE)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", masked)
+    return [p.replace(placeholder, ".").strip() for p in parts if p.strip()]
+
 class ClaimExtractor:
     """Extracts factual claims (times, speeds, counts, locations) from an incident report."""
 
@@ -22,7 +38,7 @@ class ClaimExtractor:
 
             # Skip synthetic disclaimer or file metadata lines
             if "SYNTHETIC" in line.upper() or line.startswith("#"):
-                parts = re.split(r"(?<=[.!?])\s+", line)
+                parts = split_into_sentences(line)
                 for p in parts:
                     p = p.strip()
                     if p and not any(tag in p.upper() for tag in ["SYNTHETIC", "FICTIONAL CASE"]):
@@ -30,8 +46,8 @@ class ClaimExtractor:
                             raw_claims.append(p)
                 continue
 
-            # Split line into sentences
-            sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", line)
+            # Split line into sentences safely
+            sentences = split_into_sentences(line)
             for s in sentences:
                 s = s.strip()
                 if s:

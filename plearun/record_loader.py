@@ -182,10 +182,13 @@ class RecordLoader:
             if stripped.startswith("#"):
                 continue
 
-            try:
-                parsed_cells = next(csv.reader([line]))
-            except Exception:
-                continue
+            if '"' in line:
+                try:
+                    parsed_cells = next(csv.reader([line]))
+                except Exception:
+                    continue
+            else:
+                parsed_cells = line.split(",")
 
             if header is None:
                 header = [c.strip().lower() for c in parsed_cells]
