@@ -46,6 +46,7 @@ class ExtractedClaim:
     is_approximate: bool = False                      # about, around, roughly
     event_type: Optional[str] = None                  # 'observation', 'stop', '911_call', 'unit_on_scene', 'lane_status'
     actor: Optional[str] = None                       # 'Officer Lee', 'driver', etc.
+    claimed_source: Optional[str] = None              # 'camera', 'bodycam', 'notes', 'dispatch'
     location: Optional[str] = None                    # 'mile marker 4', 'Harbor Gas lot'
 
 @dataclass

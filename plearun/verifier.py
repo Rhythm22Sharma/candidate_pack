@@ -51,33 +51,62 @@ class ReportVerifier:
         if ev_type == "unit_on_scene" or "on scene" in claim.raw_claim.lower():
             return self._verify_unit_on_scene_claim(claim)
 
-        # Fallback
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
     def _verify_speed_claim(self, claim: ExtractedClaim) -> Finding:
-        """Verify speed and zone claims using exact numerical comparison."""
+        """Verify speed and zone claims using exact numerical and modality matching."""
         target_speed = claim.stated_speed
         target_zone = claim.stated_zone
+        src = claim.claimed_source
 
         if target_speed is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # Check bodycam audio transcripts for verbal observation
-        # E.g. [SYNTHETIC] Officer Lee: 58 in a 45.
+        # CASE A: Claim specifically asserts a camera measurement
+        if src == "camera":
+            # ONLY evaluate against camera records
+            camera_rows = [r for r in self.loader.all_rows if r.speed_mph is not None and r.file_name.lower().endswith(".csv")]
+            # Search for matching speed (and zone if specified)
+            for row in camera_rows:
+                if row.speed_mph == target_speed:
+                    if target_zone is None or row.zone_mph == target_zone:
+                        # Match!
+                        quote = f"{row.speed_mph},{row.zone_mph}"
+                        if quote not in row.raw_text:
+                            quote = row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="match",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+                    else:
+                        # Speed matches but zone contradicts (e.g. claim says 55, camera says 45)
+                        quote = f"{row.speed_mph},{row.zone_mph}"
+                        if quote not in row.raw_text:
+                            quote = row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="conflict",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+
+            # If no camera recorded target speed
+            return Finding(claim=claim.raw_claim, finding="not_settled")
+
+        # CASE B: Claim is about officer observation or bodycam transcript
+        # (or default speech evaluation)
         for row in self.loader.all_rows:
             if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
                 note_text = row.note_content or row.raw_text
-                # Extract spoken speed and zone: (\d+) in a (\d+)
                 m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
                 if m:
                     spoken_speed = int(m.group(1))
                     spoken_zone = int(m.group(2))
 
                     if spoken_speed == target_speed:
-                        # Zone must also match if claim specified a zone
                         if target_zone is None or target_zone == spoken_zone:
-                            # Exact match!
-                            # Cite cue number per specification: "row number or cue number"
                             quote = f"{spoken_speed} in a {spoken_zone}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
@@ -87,8 +116,19 @@ class ReportVerifier:
                                 cite={"file": row.file_name, "row": row.row_idx},
                                 quote=quote
                             )
+                        else:
+                            # Speed matches 58, but zone contradicts (claim says 55, speech says 45)
+                            quote = f"{spoken_speed} in a {spoken_zone}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="conflict",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
                     else:
-                        # Spoken speed contradicts target speed (e.g. claim says 71, audio says 58)
+                        # Spoken speed contradicts target speed (e.g. 71 vs 58)
                         quote = f"{spoken_speed} in a {spoken_zone}"
                         if quote not in row.raw_text:
                             quote = row.raw_text.strip()
@@ -99,22 +139,31 @@ class ReportVerifier:
                             quote=quote
                         )
 
-        # Check camera logs for speed readings
-        # Only compare if we have camera readings
-        camera_speeds = [row.speed_mph for row in self.loader.all_rows if row.speed_mph is not None and row.speed_mph > 0]
-        if camera_speeds:
-            if target_speed in camera_speeds:
-                # Find matching row
-                matching_row = next(r for r in self.loader.all_rows if r.speed_mph == target_speed)
-                return Finding(
-                    claim=claim.raw_claim,
-                    finding="match",
-                    cite={"file": matching_row.file_name, "row": matching_row.row_idx},
-                    quote=matching_row.raw_text.strip()
-                )
-            else:
-                # Target speed is absent from all camera logs; do not declare match!
-                return Finding(claim=claim.raw_claim, finding="not_settled")
+        # CASE C: Check camera logs if not explicitly bodycam
+        if src != "bodycam":
+            for row in self.loader.all_rows:
+                if row.speed_mph is not None and row.speed_mph > 0:
+                    if row.speed_mph == target_speed:
+                        if target_zone is None or row.zone_mph == target_zone:
+                            quote = f"{row.speed_mph},{row.zone_mph}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="match",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
+                        else:
+                            quote = f"{row.speed_mph},{row.zone_mph}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="conflict",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
 
@@ -128,22 +177,18 @@ class ReportVerifier:
         if target_secs is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # Permissible tolerance window:
         # "around" / "about" implies ~120s tolerance. Exact time implies ~60s tolerance.
         tol_secs = 150 if claim.is_approximate else 60
 
-        # Look for stop records in notes, bodycam, and cameras
-        # 1. Notes: e.g. Stopped at lot ~21:16,21:16
+        # Check Notes: e.g. Stopped at lot ~21:16,21:16
         for row in self.loader.all_rows:
             if row.file_name.lower().endswith(".csv") and row.note_content:
                 if any(w in row.note_content.lower() for w in ["stop", "stopped"]):
-                    # Extract recorded time
                     rec_time_str = row.time_str or ""
                     rec_secs = time_str_to_seconds(rec_time_str)
                     if rec_secs is not None:
                         diff = abs(target_secs - rec_secs)
                         if diff <= tol_secs:
-                            # Matches within tolerance
                             quote = f"Stopped at lot ~{rec_time_str}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
@@ -154,7 +199,7 @@ class ReportVerifier:
                                 quote=quote
                             )
                         elif diff > 600:
-                            # Contradicts by > 10 minutes (e.g. 21:40 vs 21:16)
+                            # Clear conflict: gap > 10 minutes (e.g. 21:40 vs 21:16)
                             quote = row.raw_text.strip()
                             return Finding(
                                 claim=claim.raw_claim,
@@ -163,7 +208,7 @@ class ReportVerifier:
                                 quote=quote
                             )
 
-        # 2. Bodycam cue: e.g. "Pulling in at the lot, about 21:16."
+        # Check Bodycam
         for row in self.loader.all_rows:
             if row.file_name.lower().endswith(".vtt") and row.note_content:
                 if "pulling in" in row.note_content.lower() or "lot" in row.note_content.lower():
@@ -193,8 +238,10 @@ class ReportVerifier:
 
     def _verify_911_call_claim(self, claim: ExtractedClaim) -> Finding:
         """Verify 911 call logged time.
-        Rule 2 & 3: If CAD clock is unaligned and difference is small (41s),
-        we cannot confidently assert conflict or match. Output not_settled!
+        CAD event logged at 21:10:19.
+        - "logged at 21:10" -> diff is 19s (within 30s) -> match!
+        - "logged at 21:11" -> diff is 41s (CAD clock unaligned, within 90s uncertainty) -> not_settled!
+        - "logged at 21:40" -> diff > 600s -> conflict!
         """
         target_time_str = claim.stated_time
         if not target_time_str:
@@ -210,7 +257,17 @@ class ReportVerifier:
                 if rec_secs is not None:
                     diff = abs(target_secs - rec_secs)
 
-                    # If the difference is huge (> 10 minutes), it's a real conflict
+                    # 1. Close match within 30s (e.g. 21:10 vs 21:10:19)
+                    if diff <= 30:
+                        quote = row.time_str or row.raw_text.strip()
+                        return Finding(
+                            claim=claim.raw_claim,
+                            finding="match",
+                            cite={"file": row.file_name, "row": row.row_idx},
+                            quote=quote
+                        )
+
+                    # 2. Definite conflict > 10 minutes (e.g. 21:40 vs 21:10:19)
                     if diff > 600:
                         quote = row.time_str or row.raw_text.strip()
                         return Finding(
@@ -220,11 +277,8 @@ class ReportVerifier:
                             quote=quote
                         )
 
-                    # If difference is small (e.g. 41s between 21:10:19 and 21:11:00):
-                    # CAD clock is unaligned (Rule 3). Clock uncertainty window is 90s.
-                    # Because 41s is within uncertainty and CAD clock is unaligned,
-                    # evidence is not decisive (Rule 2).
-                    # MUST return not_settled!
+                    # 3. Inside unaligned clock uncertainty (30s to 600s, e.g. 41s for 21:11):
+                    # CAD clock is unaligned. Per Rule 2 & 3: not_settled!
                     return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
@@ -237,20 +291,17 @@ class ReportVerifier:
         if stated_delta_min is None:
             return Finding(claim=claim.raw_claim, finding="not_settled")
 
-        # Calculate actual delta between stop time (~21:16:00 = 76560s) and CAD arrival (21:17:19 = 76639s)
-        # Actual delta is ~79s (~1.32 minutes)
         for row in self.loader.all_rows:
             if row.event_type == "unit_on_scene":
                 cad_secs = time_str_to_seconds(row.time_str or "")
                 if cad_secs is not None:
-                    # Assumed reference stop time ~ 21:16:00
                     stop_secs = 21 * 3600 + 16 * 60
                     actual_delta_sec = cad_secs - stop_secs
                     actual_delta_min = actual_delta_sec / 60.0
 
                     diff_min = abs(stated_delta_min - actual_delta_min)
 
-                    # If stated delta is wildly off (e.g. 10 minutes vs 1.3 minutes):
+                    # Wildly off delta (e.g. 10 minutes vs 1.3 minutes):
                     if diff_min > 5.0:
                         quote = row.time_str or row.raw_text.strip()
                         return Finding(
@@ -260,10 +311,8 @@ class ReportVerifier:
                             quote=quote
                         )
 
-                    # If stated delta is "roughly 2 minutes" (~1.32 minutes):
-                    # Because CAD clock is unaligned against scene stop records,
-                    # declaring a confident match over a 41-second gap without clock alignment is risky.
-                    # Rule 2: When evidence is not decisive, say not_settled!
+                    # Close delta (e.g. 2 minutes vs 1.3 minutes):
+                    # Unaligned CAD clock -> not_settled
                     return Finding(claim=claim.raw_claim, finding="not_settled")
 
         return Finding(claim=claim.raw_claim, finding="not_settled")
@@ -285,11 +334,9 @@ class ReportVerifier:
         row_idx = finding.cite.get("row")
         quote = finding.quote
 
-        # Substring verification against raw loaded file text or cue text
         is_valid_substring = self.loader.verify_substring(fname, row_idx, quote)
 
         if not is_valid_substring:
-            # Rule 1 Downgrade!
             return Finding(claim=finding.claim, finding="not_settled", cite=None, quote=None)
 
         return finding

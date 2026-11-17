@@ -60,11 +60,11 @@ class ClaimExtractor:
 
         # Posted zone / speed limit
         zone = None
-        zone_match = re.search(r"(?:posted|speed\s*limit|zone\s*of|zone)?\s*(\d{2})\s*(?:zone|limit)?", lower)
-        # More targeted zone extraction: "in a 45", "posted 45 zone"
-        zone_m2 = re.search(r"(?:posted|in\s*a\s*posted|in\s*a)\s*(\d{2})\s*(?:zone)?", lower)
-        if zone_m2:
-            zone = int(zone_m2.group(1))
+        zone_match = re.search(r"(?:posted|in\s*a\s*posted|in\s*a|zone\s*of|speed\s*limit)\s*(\d{2})\b", lower)
+        if not zone_match:
+            zone_match = re.search(r"\b(\d{2})\s*(?:mph\s*)?zone\b", lower)
+        if zone_match:
+            zone = int(zone_match.group(1))
 
         # Clock time: e.g. 21:14, 21:16, 21:11, 21:40
         time_val = None
@@ -80,6 +80,17 @@ class ClaimExtractor:
         if rel_match:
             delta_min = float(rel_match.group(1))
             rel_event = rel_match.group(2)
+
+        # Claimed source
+        claimed_source = None
+        if re.search(r"\b(camera|traffic\s*cam|cam-\d+)\b", lower):
+            claimed_source = "camera"
+        elif re.search(r"\b(bodycam|transcript|audio|speech)\b", lower):
+            claimed_source = "bodycam"
+        elif re.search(r"\b(dispatch|cad|911\s*call)\b", lower):
+            claimed_source = "dispatch"
+        elif re.search(r"\b(officer\s*lee)\b", lower):
+            claimed_source = "bodycam"
 
         # Event type classification
         ev_type = "unknown"
@@ -126,5 +137,6 @@ class ClaimExtractor:
             is_approximate=is_approx,
             event_type=ev_type,
             actor=actor,
+            claimed_source=claimed_source,
             location=location
         )

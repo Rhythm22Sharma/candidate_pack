@@ -89,6 +89,32 @@ class TestVerifier(unittest.TestCase):
         self.assertNotEqual(f4.finding, "match", "10 minutes must not match ~1.3 minute actual delta!")
         self.assertEqual(f4.finding, "conflict")
 
+    def test_camera_modality_matches_camera_log(self):
+        """Camera-specific claims must evaluate against camera logs, not bodycam speech."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("The camera recorded the vehicle at 67 mph.")[0]
+        f = self.verifier.verify_claim(c)
+        self.assertEqual(f.finding, "match")
+        self.assertEqual(f.cite["file"], "camera_log.csv")
+        self.assertEqual(f.cite["row"], 4)
+
+    def test_zone_mismatch_triggers_conflict(self):
+        """A claim asserting 58 mph in a posted 55 zone must NOT match a 45 zone record."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("The vehicle was travelling 58 mph in a posted 55 zone.")[0]
+        f = self.verifier.verify_claim(c)
+        self.assertNotEqual(f.finding, "match", "55 zone claim must not match 45 zone records!")
+        self.assertEqual(f.finding, "conflict")
+
+    def test_911_call_at_2110_matches_cad_log(self):
+        """A claim asserting 911 call logged at 21:10 matches CAD logged at 21:10:19 (19s diff)."""
+        extractor = ClaimExtractor()
+        c = extractor.extract_from_text("A 911 call reporting the incident was logged at 21:10.")[0]
+        f = self.verifier.verify_claim(c)
+        self.assertEqual(f.finding, "match")
+        self.assertEqual(f.cite["file"], "dispatch.json")
+        self.assertEqual(f.cite["row"], 9)
+
     def test_rule_1_downgrades_to_not_settled_on_quote_mismatch(self):
         fake_finding = Finding(
             claim="Officer Lee observed the vehicle.",
