@@ -8,29 +8,107 @@ from plearun.models import RecordRow, LoadedRecordFile
 from plearun.clock_sync import parse_flexible_timestamp
 from plearun.security import sanitize_as_literal_data, contains_adversarial_injection, neutralize_injections
 
+def read_text(path: str) -> str:
+    """Read a text file resiliently, detecting UTF-16 (BOM/no BOM),
+    UTF-8-SIG (BOM), plain UTF-8, and CP1252/Latin-1.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    # 1. UTF-16 with BOM
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+
+    # 2. UTF-8 with BOM
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+
+    # 3. UTF-16 without BOM (detect null bytes in the first 200 bytes)
+    if b"\x00" in raw[:200]:
+        even_nulls = sum(1 for i in range(0, min(len(raw), 200), 2) if raw[i] == 0)
+        odd_nulls = sum(1 for i in range(1, min(len(raw), 200), 2) if raw[i] == 0)
+        preferred = "utf-16-be" if even_nulls > odd_nulls else "utf-16-le"
+        alternate = "utf-16-le" if preferred == "utf-16-be" else "utf-16-be"
+        try:
+            return raw.decode(preferred)
+        except UnicodeDecodeError:
+            pass
+        try:
+            return raw.decode(alternate)
+        except UnicodeDecodeError:
+            pass
+
+    # 4. Check if filename hints at CP1252
+    if "cp1252" in path.lower() or "windows-1252" in path.lower():
+        try:
+            return raw.decode("cp1252")
+        except UnicodeDecodeError:
+            pass
+
+    # 5. Plain UTF-8
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # 6. CP1252 / Latin-1 fallback
+    try:
+        return raw.decode("cp1252")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="replace")
+
+
 def detect_and_read_file(file_path: str) -> Tuple[str, List[str], str]:
-    """Read a file trying encodings: utf-8-sig (handles BOM), cp1252, utf-8, latin-1.
+    """Read a file detecting encodings (UTF-16, UTF-8-SIG, UTF-8, CP1252, Latin-1).
     Returns: (full_content, raw_lines, used_encoding)
     """
-    if "cp1252" in file_path.lower() or "windows-1252" in file_path.lower():
-        encodings_to_try = ["cp1252", "utf-8-sig", "utf-8", "latin-1"]
-    else:
-        encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
-
     with open(file_path, "rb") as f:
-        raw_bytes = f.read()
+        raw = f.read()
 
-    for enc in encodings_to_try:
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        text = raw.decode("utf-16")
+        return text, text.splitlines(), "utf-16"
+
+    if raw.startswith(b"\xef\xbb\xbf"):
+        text = raw.decode("utf-8-sig")
+        return text, text.splitlines(), "utf-8-sig"
+
+    if b"\x00" in raw[:200]:
+        even_nulls = sum(1 for i in range(0, min(len(raw), 200), 2) if raw[i] == 0)
+        odd_nulls = sum(1 for i in range(1, min(len(raw), 200), 2) if raw[i] == 0)
+        preferred = "utf-16-be" if even_nulls > odd_nulls else "utf-16-le"
+        alternate = "utf-16-le" if preferred == "utf-16-be" else "utf-16-be"
         try:
-            text = raw_bytes.decode(enc)
-            # Use universal newline splitting with exact string preservation
-            lines = text.splitlines()
-            return text, lines, enc
-        except (UnicodeDecodeError, UnicodeError):
-            continue
+            text = raw.decode(preferred)
+            return text, text.splitlines(), preferred
+        except UnicodeDecodeError:
+            pass
+        try:
+            text = raw.decode(alternate)
+            return text, text.splitlines(), alternate
+        except UnicodeDecodeError:
+            pass
+            pass
 
-    text = raw_bytes.decode("latin-1", errors="replace")
-    return text, text.splitlines(), "latin-1"
+    if "cp1252" in file_path.lower() or "windows-1252" in file_path.lower():
+        try:
+            text = raw.decode("cp1252")
+            return text, text.splitlines(), "cp1252"
+        except UnicodeDecodeError:
+            pass
+
+    try:
+        text = raw.decode("utf-8")
+        return text, text.splitlines(), "utf-8"
+    except UnicodeDecodeError:
+        pass
+
+    try:
+        text = raw.decode("cp1252")
+        return text, text.splitlines(), "cp1252"
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="replace")
+        return text, text.splitlines(), "latin-1"
 
 
 class RecordLoader:

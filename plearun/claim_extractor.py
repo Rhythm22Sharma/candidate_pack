@@ -8,8 +8,8 @@ class ClaimExtractor:
     """Extracts factual claims (times, speeds, counts, locations) from an incident report."""
 
     def extract_from_file(self, file_path: str) -> List[ExtractedClaim]:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        from plearun.record_loader import read_text
+        text = read_text(file_path)
         return self.extract_from_text(text)
 
     def extract_from_text(self, text: str) -> List[ExtractedClaim]:
