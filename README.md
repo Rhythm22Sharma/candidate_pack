@@ -25,5 +25,7 @@
 - **Multi-Incident CAD Logs**: CAD exports mix dispatches across multiple simultaneous incidents.
 
 ## Tools Used & Verification Methodology
-- **AI Assistant**: Google Antigravity was used for architectural scaffolding, regex drafting, and test generation.
-- **Human Engineering & Verification**: Directed tool iterations, designed domain verification rules, audited logic, verified crash handling, and validated all 42 offline unit tests (`make test`).
+- **Coding Agents**:
+  - **Google Antigravity**: Architectural scaffolding, multi-file orchestration, clock synchronization logic, and test harness integration.
+  - **OpenAI Codex**: Targeted regex synthesis for time/speed extraction, multi-encoding edge cases, and unit test generation.
+- **Human Engineering & Verification**: Directed engineering decisions, audited domain verification rules, verified crash handling, and validated all 42 offline unit tests (`make test`).
