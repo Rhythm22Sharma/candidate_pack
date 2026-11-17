@@ -120,7 +120,7 @@ class ReportVerifier:
                         spoken_speed = int(m.group(1))
                         spoken_zone = int(m.group(2))
                         # If record says zone is 45, and claim asserts 55:
-                        if spoken_zone != target_zone and (spoken_speed == target_speed or spoken_speed == 58):
+                        if spoken_zone != target_zone and (spoken_speed == target_speed or src in ("officer", "bodycam")):
                             quote = f"{spoken_speed} in a {spoken_zone}"
                             if quote not in row.raw_text:
                                 quote = row.raw_text.strip()
@@ -165,18 +165,25 @@ class ReportVerifier:
                                 quote=quote
                             )
 
-        # If claim says 71 in a 45 (even without explicit officer word), but bodycam and all cameras contradict:
-        if target_speed == 71:
+        # Check for speed conflict when observation in a posted zone contradicts recorded observation
+        if claim.event_type == "observation" and target_zone is not None:
             for row in self.loader.all_rows:
                 if row.event_type == "speech" or row.file_name.lower().endswith(".vtt"):
-                    quote = "58 in a 45"
-                    if quote in row.raw_text:
-                        return Finding(
-                            claim=claim.raw_claim,
-                            finding="conflict",
-                            cite={"file": row.file_name, "row": row.row_idx},
-                            quote=quote
-                        )
+                    note_text = row.note_content or row.raw_text
+                    m = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*|/|\s+)(\d{2,3})\b", note_text)
+                    if m:
+                        spoken_speed = int(m.group(1))
+                        spoken_zone = int(m.group(2))
+                        if spoken_zone == target_zone and spoken_speed != target_speed:
+                            quote = f"{spoken_speed} in a {spoken_zone}"
+                            if quote not in row.raw_text:
+                                quote = row.raw_text.strip()
+                            return Finding(
+                                claim=claim.raw_claim,
+                                finding="conflict",
+                                cite={"file": row.file_name, "row": row.row_idx},
+                                quote=quote
+                            )
 
         # Otherwise: unrecorded speed or ambiguous -> not_settled
         return Finding(claim=claim.raw_claim, finding="not_settled")
