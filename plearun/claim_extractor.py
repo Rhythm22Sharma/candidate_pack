@@ -2,6 +2,7 @@
 import re
 from typing import List, Optional
 from plearun.models import ExtractedClaim
+from plearun.clock_sync import time_str_to_seconds
 
 class ClaimExtractor:
     """Extracts factual claims (times, speeds, counts, locations) from an incident report."""
@@ -21,13 +22,10 @@ class ClaimExtractor:
 
             # Skip synthetic disclaimer or file metadata lines
             if "SYNTHETIC" in line.upper() or line.startswith("#"):
-                # If the line is only disclaimer/header, skip
-                # Check if there is narrative content after the header
                 parts = re.split(r"(?<=[.!?])\s+", line)
                 for p in parts:
                     p = p.strip()
                     if p and not any(tag in p.upper() for tag in ["SYNTHETIC", "FICTIONAL CASE"]):
-                        # Check if it has a predicate verb (factual claim vs title fragment)
                         if any(w in p.lower() for w in [" observed", " stopped", " logged", " showed", " states", " was ", " travelling", " arrived"]):
                             raw_claims.append(p)
                 continue
@@ -39,7 +37,6 @@ class ClaimExtractor:
                 if s:
                     raw_claims.append(s)
 
-        # Parse semantics for each claim
         extracted = []
         for idx, claim_str in enumerate(raw_claims):
             sem = self._parse_semantics(claim_str, idx)
@@ -50,28 +47,33 @@ class ClaimExtractor:
     def _parse_semantics(self, claim: str, idx: int) -> ExtractedClaim:
         lower = claim.lower()
 
-        # Check approximation indicators
-        is_approx = bool(re.search(r"\b(about|around|roughly|approx|approximately)\b", lower))
+        # Approximation indicators
+        is_approx = bool(re.search(r"\b(about|around|roughly|approx|approximately|near)\b", lower))
 
-        # Check speeds e.g. "58 mph in a posted 45 zone"
+        # Speed: e.g. "58 mph", "71 mph", "travelling 58"
         speed = None
-        speed_match = re.search(r"(\d+)\s*(?:mph|miles per hour)", lower)
+        speed_match = re.search(r"(?:travelling|speed\s+of|going)?\s*(\d+)\s*(?:mph|miles\s+per\s+hour)", lower)
+        if not speed_match:
+            speed_match = re.search(r"\b(\d{2,3})\s*(?:in\s*a\s*\d{2})\b", lower)
         if speed_match:
             speed = int(speed_match.group(1))
 
-        # Check posted zone
+        # Posted zone / speed limit
         zone = None
-        zone_match = re.search(r"(?:posted|speed limit|zone)\s*(?:of\s*)?(\d+)", lower)
-        if zone_match:
-            zone = int(zone_match.group(1))
+        zone_match = re.search(r"(?:posted|speed\s*limit|zone\s*of|zone)?\s*(\d{2})\s*(?:zone|limit)?", lower)
+        # More targeted zone extraction: "in a 45", "posted 45 zone"
+        zone_m2 = re.search(r"(?:posted|in\s*a\s*posted|in\s*a)\s*(\d{2})\s*(?:zone)?", lower)
+        if zone_m2:
+            zone = int(zone_m2.group(1))
 
-        # Check time expressions e.g. 21:14, 21:16, 21:11
+        # Clock time: e.g. 21:14, 21:16, 21:11, 21:40
         time_val = None
         time_match = re.search(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", claim)
         if time_match:
             time_val = time_match.group(1)
+        time_secs = time_str_to_seconds(time_val) if time_val else None
 
-        # Check relative time e.g. "roughly 2 minutes after the stop"
+        # Relative delta: e.g. "roughly 2 minutes after the stop", "10 minutes after"
         delta_min = None
         rel_event = None
         rel_match = re.search(r"(\d+(?:\.\d+)?)\s*minutes?\s+after\s+(?:the\s+)?(\w+)", lower)
@@ -81,13 +83,16 @@ class ClaimExtractor:
 
         # Event type classification
         ev_type = "unknown"
-        if "observed" in lower or "travelling" in lower or "mph" in lower:
+        if "observed" in lower or "travelling" in lower or speed is not None:
             ev_type = "observation"
-        elif "pulled into" in lower or "stopped" in lower:
-            ev_type = "stop"
+        elif "pulled into" in lower or "stopped" in lower or "stop" in lower:
+            if delta_min is not None and "on scene" in lower:
+                ev_type = "unit_on_scene"
+            else:
+                ev_type = "stop"
         elif "911 call" in lower or "call" in lower:
             ev_type = "911_call"
-        elif "unit on scene" in lower or "on scene" in lower or "dispatch records show" in lower:
+        elif "on scene" in lower or "dispatch records show" in lower:
             ev_type = "unit_on_scene"
         elif "only car" in lower or "lane" in lower:
             ev_type = "lane_status"
@@ -105,8 +110,9 @@ class ClaimExtractor:
         location = None
         if "harbor gas" in lower:
             location = "Harbor Gas lot"
-        elif "mile marker 4" in lower:
-            location = "mile marker 4"
+        elif "mile marker" in lower:
+            mm_match = re.search(r"mile\s*marker\s*(\d+)", lower)
+            location = f"mile marker {mm_match.group(1)}" if mm_match else "mile marker"
 
         return ExtractedClaim(
             raw_claim=claim,
@@ -114,6 +120,7 @@ class ClaimExtractor:
             stated_speed=speed,
             stated_zone=zone,
             stated_time=time_val,
+            stated_time_seconds=time_secs,
             stated_delta_minutes=delta_min,
             relative_to_event=rel_event,
             is_approximate=is_approx,

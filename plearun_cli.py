@@ -54,8 +54,9 @@ def main():
         "findings": [f.to_dict() for f in findings]
     }
 
-    # Print to stdout
-    print(json.dumps(output_obj, indent=2))
+    # Print to stdout with strict LF line endings and UTF-8
+    out_str = json.dumps(output_obj, indent=2) + "\n"
+    sys.stdout.buffer.write(out_str.encode("utf-8"))
 
 if __name__ == "__main__":
     main()

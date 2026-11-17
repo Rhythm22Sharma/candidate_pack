@@ -41,8 +41,8 @@ class TestClockSync(unittest.TestCase):
             speed_mph=50
         )
         sync.align_records([row_orphan])
-        # Device has no anchor stop event, so must NOT be shifted arbitrarily
-        self.assertTrue(sync.is_aligned("CAM-UNKNOWN"))
+        # Device has no anchor stop event, so must remain UNALIGNED (is_aligned returns False)
+        self.assertFalse(sync.is_aligned("CAM-UNKNOWN"))
         self.assertNotIn("CAM-UNKNOWN", sync.device_offsets)
         aligned_ts = sync.get_aligned_timestamp(row_orphan)
         self.assertEqual(aligned_ts, row_orphan.timestamp)

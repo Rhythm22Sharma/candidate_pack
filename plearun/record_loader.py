@@ -6,28 +6,29 @@ import json
 from typing import Dict, List, Optional, Tuple, Any
 from plearun.models import RecordRow, LoadedRecordFile
 from plearun.clock_sync import parse_flexible_timestamp
+from plearun.security import sanitize_as_literal_data, contains_adversarial_injection, neutralize_injections
 
 def detect_and_read_file(file_path: str) -> Tuple[str, List[str], str]:
-    """Read a file trying encodings: utf-8-sig (handles BOM), utf-8, cp1252, latin-1.
+    """Read a file trying encodings: utf-8-sig (handles BOM), cp1252, utf-8, latin-1.
     Returns: (full_content, raw_lines, used_encoding)
     """
     if "cp1252" in file_path.lower() or "windows-1252" in file_path.lower():
         encodings_to_try = ["cp1252", "utf-8-sig", "utf-8", "latin-1"]
     else:
         encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+
     with open(file_path, "rb") as f:
         raw_bytes = f.read()
 
     for enc in encodings_to_try:
         try:
             text = raw_bytes.decode(enc)
-            # splitlines(keepends=False)
+            # Use universal newline splitting with exact string preservation
             lines = text.splitlines()
             return text, lines, enc
         except (UnicodeDecodeError, UnicodeError):
             continue
 
-    # Fallback with replacement
     text = raw_bytes.decode("latin-1", errors="replace")
     return text, text.splitlines(), "latin-1"
 
@@ -46,6 +47,9 @@ class RecordLoader:
 
         for root, _, filenames in os.walk(records_dir):
             for fname in sorted(filenames):
+                # Ignore hidden files or cache directories
+                if fname.startswith(".") or fname.endswith(".pyc"):
+                    continue
                 fpath = os.path.join(root, fname)
                 self.load_file(fpath, fname)
 
@@ -58,6 +62,7 @@ class RecordLoader:
 
         text, raw_lines, enc = detect_and_read_file(file_path)
         rows: List[RecordRow] = []
+        cues_map: Dict[int, str] = {}
 
         lower_name = file_name.lower()
         if lower_name.endswith(".csv"):
@@ -67,10 +72,9 @@ class RecordLoader:
             rows = self._parse_json(file_name, text, raw_lines)
             fmt = "json"
         elif lower_name.endswith(".vtt") or text.startswith("WEBVTT"):
-            rows = self._parse_vtt(file_name, raw_lines)
+            rows, cues_map = self._parse_vtt(file_name, raw_lines)
             fmt = "vtt"
         else:
-            # Fallback text parser
             rows = self._parse_plain_text(file_name, raw_lines)
             fmt = "txt"
 
@@ -80,6 +84,7 @@ class RecordLoader:
             format=fmt,
             encoding=enc,
             raw_lines=raw_lines,
+            cues=cues_map,
             rows=rows
         )
         self.files[file_name] = loaded
@@ -87,35 +92,32 @@ class RecordLoader:
         return loaded
 
     def _parse_csv(self, file_name: str, raw_lines: List[str]) -> List[RecordRow]:
-        """Parse CSV with potential BOM, marker comment lines (#), and arbitrary headers."""
+        """Parse CSV with BOM, marker comment lines (#), and arbitrary headers."""
         rows: List[RecordRow] = []
         header: Optional[List[str]] = None
-        header_line_idx = -1
 
         for i, line in enumerate(raw_lines, 1):
             stripped = line.strip()
             if not stripped:
                 continue
-            # Skip comment / marker lines like '#PLEARUN ...'
+            # Treat comment / marker line as data row if requested, but skip as CSV header
             if stripped.startswith("#"):
                 continue
 
-            # Parse with csv reader
-            parsed_cells = next(csv.reader([line]))
-            if header is None:
-                header = [c.strip() for c in parsed_cells]
-                header_line_idx = i
+            try:
+                parsed_cells = next(csv.reader([line]))
+            except Exception:
                 continue
 
-            # Data row
+            if header is None:
+                header = [c.strip().lower() for c in parsed_cells]
+                continue
+
             data_map = {}
             for col_idx, col_name in enumerate(header):
                 if col_idx < len(parsed_cells):
-                    data_map[col_name.lower()] = parsed_cells[col_idx].strip()
+                    data_map[col_name] = sanitize_as_literal_data(parsed_cells[col_idx].strip())
 
-            # Extract fields
-            # Camera format: timestamp, device, speed_mph, zone_mph
-            # Notes format: ID, Author, Note, Time
             ts_val = data_map.get("timestamp") or data_map.get("time")
             dev_val = data_map.get("device") or data_map.get("author") or data_map.get("id")
             
@@ -129,6 +131,9 @@ class RecordLoader:
 
             note_text = data_map.get("note") or data_map.get("message")
             author = data_map.get("author")
+            is_adv = contains_adversarial_injection(line)
+            if note_text:
+                note_text = neutralize_injections(note_text)
 
             parsed_ts = parse_flexible_timestamp(ts_val) if ts_val else None
 
@@ -144,6 +149,7 @@ class RecordLoader:
                 speed_mph=speed,
                 zone_mph=zone,
                 note_content=note_text,
+                is_adversarial=is_adv,
                 data=data_map
             )
             rows.append(row_obj)
@@ -158,7 +164,6 @@ class RecordLoader:
         except json.JSONDecodeError:
             return rows
 
-        # Locate events array
         events = []
         if isinstance(parsed, dict):
             if "export" in parsed and "events" in parsed["export"]:
@@ -170,16 +175,15 @@ class RecordLoader:
         elif isinstance(parsed, list):
             events = parsed
 
-        # For each event, locate where it appears in raw_lines
         for ev in events:
             if not isinstance(ev, dict):
                 continue
-            ev_id = ev.get("id", "")
-            ev_type = ev.get("type", "")
+            ev_id = sanitize_as_literal_data(ev.get("id", ""))
+            ev_type = sanitize_as_literal_data(ev.get("type", ""))
             logged_val = ev.get("logged") or ev.get("timestamp") or ev.get("time")
-            unit_val = ev.get("unit")
+            unit_val = sanitize_as_literal_data(ev.get("unit", ""))
 
-            # Find matching line number in raw_lines
+            # Map to line number in raw_lines
             line_idx = 1
             line_text = ""
             for idx, l in enumerate(raw_lines, 1):
@@ -197,6 +201,7 @@ class RecordLoader:
             if not line_text and 1 <= line_idx <= len(raw_lines):
                 line_text = raw_lines[line_idx - 1]
 
+            is_adv = contains_adversarial_injection(line_text)
             parsed_ts = parse_flexible_timestamp(logged_val)
 
             row_obj = RecordRow(
@@ -205,65 +210,70 @@ class RecordLoader:
                 raw_text=line_text,
                 timestamp=parsed_ts,
                 time_str=str(logged_val) if logged_val is not None else None,
-                device=unit_val or ev_id,
+                device=unit_val or ev_id or "CAD",
                 author="Dispatch",
                 event_type=ev_type or "cad_event",
-                note_content=f"{ev_type} {unit_val or ''}".strip(),
+                note_content=f"{ev_type} {unit_val}".strip(),
+                is_adversarial=is_adv,
                 data=ev
             )
             rows.append(row_obj)
 
         return rows
 
-    def _parse_vtt(self, file_name: str, raw_lines: List[str]) -> List[RecordRow]:
-        """Parse WebVTT files with cues and overlapping timestamps."""
+    def _parse_vtt(self, file_name: str, raw_lines: List[str]) -> Tuple[List[RecordRow], Dict[int, str]]:
+        """Parse WebVTT cues, assigning 1-indexed cue numbers according to the specification."""
         rows: List[RecordRow] = []
+        cues_map: Dict[int, str] = {}
         cue_idx = 0
         i = 0
         n = len(raw_lines)
 
         while i < n:
             line = raw_lines[i]
-            # Match WebVTT timestamp line: '00:00:00.000 --> 00:00:04.000'
             if "-->" in line:
                 cue_idx += 1
-                timing_line_idx = i + 1
-                # Next line is speech payload
+                timing_str = line.strip()
                 i += 1
                 payload_lines = []
-                payload_line_idx = i + 1
                 while i < n and raw_lines[i].strip():
                     payload_lines.append(raw_lines[i])
                     i += 1
-                
-                payload_text = " ".join(payload_lines)
+
+                cue_text = "\n".join(payload_lines)
+                cues_map[cue_idx] = cue_text
+
                 author = None
-                speech = payload_text
-                # E.g. [SYNTHETIC] Officer Lee: 58 in a 45.
-                speaker_match = re.search(r"(?:\[SYNTHETIC\]\s*)?([^:]+):\s*(.*)", payload_text)
+                speech = cue_text
+                speaker_match = re.search(r"(?:\[SYNTHETIC\]\s*)?([^:]+):\s*(.*)", cue_text, re.DOTALL)
                 if speaker_match:
                     author = speaker_match.group(1).strip()
                     speech = speaker_match.group(2).strip()
 
-                # In WebVTT, citation row can be line number of text or cue number
-                # We cite the line where the quote appears (payload_line_idx)
+                is_adv = contains_adversarial_injection(cue_text)
+                if speech:
+                    speech = neutralize_injections(speech)
+
+                # For WebVTT, row_idx is the cue number (1, 2, 3...) per spec: "row number or cue number"
                 row_obj = RecordRow(
                     file_name=file_name,
-                    row_idx=payload_line_idx,
-                    raw_text=raw_lines[payload_line_idx - 1] if payload_line_idx <= len(raw_lines) else payload_text,
-                    timestamp=None,  # VTT times are video offsets (00:00:00)
-                    time_str=line.strip(),
+                    row_idx=cue_idx,     # Cue number as row index!
+                    cue_idx=cue_idx,
+                    raw_text=cue_text,   # Raw text of that cue
+                    timestamp=None,      # WebVTT timestamps are relative media offsets
+                    time_str=timing_str,
                     device="bodycam",
                     author=author,
                     event_type="speech",
                     note_content=speech,
-                    data={"cue_index": cue_idx, "timing": line.strip(), "full_cue": payload_text}
+                    is_adversarial=is_adv,
+                    data={"cue_index": cue_idx, "timing": timing_str, "full_cue": cue_text}
                 )
                 rows.append(row_obj)
             else:
                 i += 1
 
-        return rows
+        return rows, cues_map
 
     def _parse_plain_text(self, file_name: str, raw_lines: List[str]) -> List[RecordRow]:
         rows: List[RecordRow] = []
@@ -280,10 +290,23 @@ class RecordLoader:
         return rows
 
     def verify_substring(self, file_name: str, row_idx: int, quote: str) -> bool:
-        """Enforces Rule 1: quote MUST be an exact substring of raw text at row_idx."""
-        if file_name not in self.files:
+        """Enforces Rule 1: quote MUST be an exact substring of raw text of that row/cue."""
+        if not file_name or file_name not in self.files or not quote:
             return False
         loaded = self.files[file_name]
+
+        # If it's a VTT file, check cue text (or raw line as fallback)
+        if loaded.format == "vtt":
+            if row_idx in loaded.cues:
+                if quote in loaded.cues[row_idx]:
+                    return True
+            # Fallback to line index
+            if 1 <= row_idx <= len(loaded.raw_lines):
+                if quote in loaded.raw_lines[row_idx - 1]:
+                    return True
+            return False
+
+        # For line-based files (CSV, JSON, TXT)
         if not (1 <= row_idx <= len(loaded.raw_lines)):
             return False
         raw_row = loaded.raw_lines[row_idx - 1]
